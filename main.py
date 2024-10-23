@@ -8,31 +8,17 @@ import os
 os.chdir('...')
 # !ls
 
+TORCH = '2.4.0'
+CUDA = 'cpu'
+
 import torch
-
-def format_pytorch_version(version):
-  return version.split('+')[0]
-
-TORCH_version = torch.__version__
-TORCH = format_pytorch_version(TORCH_version)
-
-def format_cuda_version(version):
-  return 'cu' + version.replace('.', '')
-
-CUDA_version = torch.version.cuda
-CUDA = format_cuda_version(CUDA_version)
-
-# !pip install torch-scatter -f https://pytorch-geometric.com/whl/torch-{TORCH}+{CUDA}.html
-# !pip install torch-sparse -f https://pytorch-geometric.com/whl/torch-{TORCH}+{CUDA}.html
-# !pip install torch-cluster -f https://pytorch-geometric.com/whl/torch-{TORCH}+{CUDA}.html
-# !pip install torch-spline-conv -f https://pytorch-geometric.com/whl/torch-{TORCH}+{CUDA}.html
-# !pip install torch-geometric
-# !pip install torch-geometric-temporal
-
-# !pip install wandb
 import wandb
 
-"""## Libraries"""
+
+
+
+
+"""# Libraries"""
 
 '''commun libraries'''
 
@@ -70,48 +56,60 @@ def set_seed(seed):
   torch.cuda.manual_seed_all(seed)
   torch.use_deterministic_algorithms(True)
 
-"""# Dataset Preprocess
 
-## [ Funcs ] Node & Link Dataframes Preprocessing
-"""
 
-def coevognn_protocol_sampling_for_node_reg(links_df, gen_subsample_mask, degree_norm):
-  return None
 
-def data_egc_dt_snapshot_preprocess_dataframes(egc, egc_aggregate_timespan):
-  egc['time'] = (egc['time'] - 1) / 86400 + 1 # timestamp to day int
-  egc['time'] = egc['time'] / egc_aggregate_timespan  # aggregate to snapshots
-  egc['time'] = egc['time'].astype(int)
-  ## Mapping names to node idx
-  combined_values = pd.concat([egc['src'], egc['dst']]).unique()
-  combined_index = pd.factorize(combined_values)[0]
-  mapping_dict = dict(zip(combined_values, combined_index))
-  egc['src_id'] = egc['src'].map(mapping_dict)
-  egc['dst_id'] = egc['dst'].map(mapping_dict)
-  ## Normalizing features
-  egc['label_nb'] = np.log10(egc['nb']+1)
-  egc['label_nb'] = egc['label_nb']/egc['label_nb'].max()
-  egc['label_value'] = np.log10(egc['value']+1)
-  egc['label_value'] = egc['label_value']/egc['label_value'].max()
-  return egc, mapping_dict
 
-def data_egc_dt_prepare_dataframes(df, gen_subsample_mask=True, degree_norm=False):
+"""# Dataset Preprocess"""
+"""## [ Funcs ] Node & Link Dataframes Preprocessing"""
+
+'''Preprocessing for Node name-index mapping, node and edge dynamic attributes'''
+'''nodes_df [N,2]: replace origin node name to an index; links_df [E,*]: ts start from 0, src, dst, attrs; links_df [<=N*T,4]: node, ts, in-deg, out-deg'''
+
+def data_bc_readcsv_norm(p, time_win_aggr, norm_func="min-max", skip_header=False):
+  if skip_header:
+    df = pd.read_csv(p, header=None, names=['src', 'dst', 'attr', 'ts'], skiprows=[0])
+  else:
+    df = pd.read_csv(p, header=None, names=['src', 'dst', 'attr', 'ts'])
+  df = df.sort_values(by=['ts']).reset_index(drop=True)
+  ## for attributes normlization
+  if norm_func == "log10-min-max":
+    df['attr'] = df['attr'].apply(lambda x: np.log10(x) if x > 0 else 0)  # Apply log10 transformation
+    max_attr = df['attr'].max()
+    df['attr'] = (df['attr']) / (max_attr)
+
+  if norm_func == "min-max":
+    min_attr = df['attr'].min()
+    max_attr = df['attr'].max()
+    if max_attr != min_attr:
+      df['attr'] = (df['attr'] - min_attr) / (max_attr - min_attr)
+    else:
+      df['attr'] = 1
+  ## for dt aggregating
+  min_ts = df['ts'].min()
+  max_ts = df['ts'].max()
+  ## Snapshot Split By Temporal
+  # time_win_length = (max_ts-min_ts) // (time_win_aggr-1)
+  # df['ts'] = (df['ts'] - min_ts) // time_win_length
+  ## Snapshot Split By Same NB Edges
+  time_win_length = len(df) // (time_win_aggr-1)
+  df['ts'] = df.index // time_win_length
+  return df
+
+def data_bc_prepare_dataframes(df, degree_norm=False):
   ## for unique node mapping
-  unique_values = set(df['src_id']) | set(df['dst_id'])
+  unique_values = set(df['src']) | set(df['dst'])
   mapping = {}
   for idx, value in enumerate(unique_values):
     mapping[value] = idx
   nodes_df = pd.DataFrame(list(mapping.items()), columns=['node_name', 'node_index'])
   ## for edge dataframe
-  df = df[['time', 'src_id', 'dst_id', 'label_nb', 'label_value']]
-  df.columns = ['ts', 'src', 'dst', 'attr', 'attr2']
-  links_df = df[['ts', 'src', 'dst', 'attr', 'attr2']].copy()
+  links_df = df[['ts', 'src', 'dst', 'attr']].copy()
   links_df['src'] = links_df['src'].map(mapping)
   links_df['dst'] = links_df['dst'].map(mapping)
-  nodes_attr = coevognn_protocol_sampling_for_node_reg(links_df, gen_subsample_mask, degree_norm)
-  return nodes_df, links_df, nodes_attr
+  return nodes_df, links_df
 
-'''nodes: array(0..N-1); times: array(0..T-1); edgelists:  ;'''
+'''nodes: array(0..N-1); times: array(0..T-1)'''
 
 def load_temporalgraphs(nodes_df, links_df):
   ''' Raw edgelist (un-indexed) for each time '''
@@ -126,8 +124,49 @@ def load_temporalgraphs(nodes_df, links_df):
     edgelists_attr.append(torch.tensor(edges_t.drop(['src', 'dst'], axis=1).values).T) # In case that attr is used for forward
   return nodes, times, edgelists, edgelists_attr
 
-"""## [ Funcs ] Negative Sampling"""
+# '''processing EGC datasets'''
 
+# def data_egc_dt_snapshot_preprocess_dataframes(egc, egc_aggregate_timespan):
+#   egc['time'] = (egc['time'] - 1) / 86400 + 1 # timestamp to day int
+#   egc['time'] = egc['time'] / egc_aggregate_timespan  # aggregate to snapshots
+#   egc['time'] = egc['time'].astype(int)
+#   ## Mapping names to node idx
+#   combined_values = pd.concat([egc['src'], egc['dst']]).unique()
+#   combined_index = pd.factorize(combined_values)[0]
+#   mapping_dict = dict(zip(combined_values, combined_index))
+#   egc['src_id'] = egc['src'].map(mapping_dict)
+#   egc['dst_id'] = egc['dst'].map(mapping_dict)
+#   ## Normalizing features
+#   egc['label_nb'] = np.log10(egc['nb']+1)
+#   egc['label_nb'] = egc['label_nb']/egc['label_nb'].max()
+#   egc['label_value'] = np.log10(egc['value']+1)
+#   egc['label_value'] = egc['label_value']/egc['label_value'].max()
+#   return egc, mapping_dict
+
+# def data_egc_dt_prepare_dataframes(df, gen_subsample_mask=True, degree_norm=False):
+#   ## for unique node mapping
+#   unique_values = set(df['src_id']) | set(df['dst_id'])
+#   mapping = {}
+#   for idx, value in enumerate(unique_values):
+#     mapping[value] = idx
+#   nodes_df = pd.DataFrame(list(mapping.items()), columns=['node_name', 'node_index'])
+#   ## for edge dataframe
+#   df = df[['time', 'src_id', 'dst_id', 'label_nb', 'label_value']]
+#   df.columns = ['ts', 'src', 'dst', 'attr', 'attr2']
+#   links_df = df[['ts', 'src', 'dst', 'attr', 'attr2']].copy()
+#   links_df['src'] = links_df['src'].map(mapping)
+#   links_df['dst'] = links_df['dst'].map(mapping)
+#   return nodes_df, links_df
+
+
+
+
+
+
+## nodes_attr
+
+
+"""## [ Funcs ] Negative Sampling"""
 '''
 Following functions get_edges_ids, sample_edges, get_non_existing_edges are from EvolveGCN
 ref; EvolveGCN
@@ -217,6 +256,9 @@ def negative_edge_sampling(edgelists, idx_end_train, times, tot_nodes,
       #e_t.shape[0]
       sampled_negative_edges.append(current_negatives[:,0].reshape(2,1)) # when there is no edge, sample at least 1 negative from latest
   return sampled_negative_edges, nodelists
+  
+
+
 
 """## [ Funcs ] Spectral Analysing"""
 
@@ -363,14 +405,17 @@ def precompute_spectral_supports(args, egc_df=None): # using args.data
     torch.save(eigen_vals, 'spec/%s_snapshot_eigenval.pt'%args.data)
   print("Computation Finished!")
 
-"""# Model Archi
 
-## [ Mods ] Models - CoEvoSAGE(-LSTM) - DspGNN
-"""
 
-"""
-Model of CoEvoSage
-"""
+
+
+"""# Model Archi"""
+"""## [ Mods ] Models - CoEvoSAGE(-LSTM) - DspGNN"""
+
+
+
+"""Model of CoEvoSage
+ref: https://github.com/DM2-ND/CoEvoGNN/tree/main"""
 
 class CoEvoSAGE(nn.Module):
   def __init__(self, N, hid_emb_dim, K, num_sample_neighbors=20):
@@ -412,81 +457,53 @@ class CoEvoSAGE(nn.Module):
 
 
 
-class CoEvoSAGELSTM(nn.Module):
-  def __init__(self, N, d_h, K, num_sample_neighbors=20, aug_conv=False, convmod="SAGE"):
-    super(CoEvoSAGELSTM, self).__init__()
-    ''' Hidden state of all nodes at t=0 '''
-    self.K, self.N, self.d_h, self.max_nbnb = K, N, d_h, num_sample_neighbors
-    self.aug_conv = aug_conv
-    if convmod == "SAGE":
-      self.sage_conv1 = SAGEConv(d_h, d_h, aggr='mean')
-    elif convmod == "GAT":
-      self.sage_conv1 = GATConv(d_h, d_h, aggr='mean')
-    self.lstm = nn.LSTM(input_size=d_h, hidden_size=d_h, batch_first=True)
-    ''' Weights: [d_hid + d_agg, d_hid, K], K is the number of agg timesteps '''
-    self._agg_emb_dim = self.d_h
-    self.proj_linear = nn.Linear(2*d_h, d_h) # snapshot level proj
-    self.weight_linear = nn.Linear(d_h, 1) # weight of current k
-    self.init_params()
-
-  def init_params(self):
-    for param in self.parameters():
-      if len(param.shape) > 1:
-        nn.init.xavier_uniform_(param)
-      else:
-        nn.init.constant_(param, 0.)
-
-  def _step_k(self, H_k, edgelist_t): # self_feats = H_k; agg_feats = self.sage_conv(self_feats, edgelist_t)
-    agg_feats = self.sage_conv1(H_k, edgelist_t)
-    return self.proj_linear(torch.cat((H_k, agg_feats), dim=1))
-
-  def _step(self, H_K_prev, edgelists):
-    ''' lstm solution '''
-    _H_t_ks = [self._step_k(H_K_prev[k], edgelists[k]) for k in range(len(H_K_prev))]
-    H_K_stack = torch.stack(_H_t_ks, dim=1) # [N, d] to [N, K, d]
-    H_t, (hn, cn) = self.lstm(H_K_stack) # [N, K, d] for batch_first = True
-    H_t = hn[-1] # last step only
-    H_t = F.relu(H_t)
-    # H_t = F.normalize(H_t, p=2, dim=1)
-    return H_t
-
-  def forward(self, H_K_prev, edgelists):
-    ''' Generate H_t by catting previous H[t-K:t-1] (train and forecast)'''
-    H_t = self._step(H_K_prev, edgelists)
-    return torch.unsqueeze(H_t, 0) # [N,d] -> [1,N,d]
+from torch_geometric_temporal.nn.recurrent import EvolveGCNH, GCLSTM
 
 
+"""refs: 
+"EvolveGCN: Evolving Graph Convolutional Networks for Dynamic Graph." <https://arxiv.org/abs/1902.10191>
+https://pytorch-geometric-temporal.readthedocs.io/en/latest/_modules/torch_geometric_temporal/nn/recurrent/evolvegcnh.html#EvolveGCNH
+"""
 
-from torch_geometric_temporal.nn.recurrent import EvolveGCNH
-class EvolveGCN(torch.nn.Module):
-  def __init__(self, N, d, K):
-    super(EvolveGCN, self).__init__()
-    self.recurrent = EvolveGCNH(N, d)
-    self.K = K
-    # self.lin = nn.Linear(d,d)
-    self.sigmoid = nn.Sigmoid()
-    self.init_params()
-
-  def init_params(self):
-    for param in self.parameters():
-      if len(param.shape) > 1:
-        nn.init.xavier_uniform_(param)
-      else:
-        nn.init.constant_(param, 0.)
-
+class TgtEvolveGCNH(torch.nn.Module):
+  def __init__(self, N, d_h):
+    super(TgtEvolveGCNH, self).__init__()
+    self.recurrent = EvolveGCNH(num_of_nodes=N, in_channels=d_h)
   def _step(self, H_K_prev, edgelists):
     ''' lstm solution '''
     h = H_K_prev[0]
     for k in range(len(H_K_prev)):
       h = F.relu(self.recurrent(h, edgelists[k]))
       h = F.normalize(h, p=2, dim=1)
-      # h = self.sigmoid(h)
       return h
-
   def forward(self, H_K_prev, edgelists):
     ''' Generate H_t by catting previous H[t-K:t-1] (train and forecast)'''
     H_t = self._step(H_K_prev, edgelists)
     return torch.unsqueeze(H_t, 0) # [N,d] -> [1,N,d]
+
+"""refs: 
+"GC-LSTM: Graph Convolution Embedded LSTM for Dynamic Link Prediction." <https://arxiv.org/abs/1812.04206>
+https://pytorch-geometric-temporal.readthedocs.io/en/latest/_modules/torch_geometric_temporal/nn/recurrent/gc_lstm.html#GCLSTM
+"""
+
+class TgtGCLstm(torch.nn.Module):
+  def __init__(self, N, d_h, nb_spectral_supports):
+    super(TgtGCLstm, self).__init__()
+    self.recurrent = GCLSTM(in_channels=d_h, out_channels=d_h, K=nb_spectral_supports)
+  def _step(self, H_K_prev, edgelists):
+    ''' lstm solution '''
+    h = H_K_prev[0]
+    for k in range(len(H_K_prev)):
+      h, c = self.recurrent(h, edgelists[k], torch.ones((edgelists[k].shape[1])))
+      h = F.relu(h)
+      return h
+  def forward(self, H_K_prev, edgelists):
+    ''' Generate H_t by catting previous H[t-K:t-1] (train and forecast)'''
+    H_t = self._step(H_K_prev, edgelists)
+    return torch.unsqueeze(H_t, 0) # [N,d] -> [1,N,d]
+
+
+
 
 class DspGNN(nn.Module):
   def __init__(self, args, ablation_test_spectral_sup=False):
@@ -497,26 +514,17 @@ class DspGNN(nn.Module):
     self.spec_support, self.spec_eigenft = args.spec_support, args.spec_eigenft
 
     d_h = self.d_h
-    self.sage_conv1 = GraphConv(d_h, d_h, aggr='mean', project=True, bias=False)
-    self.sage_conv2 = GraphConv(d_h, d_h, aggr='mean', project=True, bias=False)
-    self.sage_conv3 = GraphConv(d_h, d_h, aggr='mean', project=True, bias=False)
-    self.sage_conv4 = GraphConv(d_h, d_h, aggr='mean', project=True, bias=False)
-    self.sage_conv5 = GraphConv(d_h, d_h, aggr='mean', project=True, bias=False)
-    self.sage_conv6 = GraphConv(d_h, d_h, aggr='mean', project=True, bias=False)
-    if args.spec_eigenft:
-      self.d_spec = args.spec_eigenft
-      self.spec_proj = nn.Linear(self.d_spec, d_h)
-      self.sage_combine_projection = nn.Linear(in_features=(self.nb_spec+2)*d_h, out_features=3*d_h)
-    else:
-      self.sage_combine_projection = nn.Linear(in_features=(self.nb_spec+1)*d_h, out_features=3*d_h)
-      self.d_spec = False
+    self.sage_conv1 = GraphConv(d_h, d_h, aggr='mean', bias=gnn_bias)
+    self.sage_conv2 = GraphConv(d_h, d_h, aggr='mean', bias=gnn_bias)
+    self.sage_conv3 = GraphConv(d_h, d_h, aggr='mean', bias=gnn_bias)
+    self.sage_conv4 = GraphConv(d_h, d_h, aggr='mean', bias=gnn_bias)
+    self.sage_conv5 = GraphConv(d_h, d_h, aggr='mean', bias=gnn_bias)
+    self.sage_conv6 = GraphConv(d_h, d_h, aggr='mean', bias=gnn_bias)
+    self.sage_combine_projection = nn.Linear(in_features=(self.nb_spec+1)*d_h, out_features=1*d_h)
+    self.d_spec = False
     ''' Weights: [d_hid + d_agg, d_hid, K], K is the number of agg timesteps '''
-    self.ablation_test_spectral_sup = ablation_test_spectral_sup
-    # self.proj_linear = nn.Linear(4*d_h, 2*d_h)
-    # self.lstm = nn.LSTM(input_size=2*d_h, hidden_size=d_h, batch_first=True)
-    self.proj_linear = nn.Linear(4*d_h, d_h)
+    self.proj_linear = nn.Linear(2*d_h, d_h)
     self.lstm = nn.LSTM(input_size=d_h, hidden_size=d_h, batch_first=True)
-
     self.dropout = nn.Dropout(p=0.5)
     self.relu = nn.ReLU()
     self.init_params()
@@ -540,13 +548,11 @@ class DspGNN(nn.Module):
     agg_feats4 = self.sage_conv4(H_k, edgelist_t, ew_t[3])
     agg_feats5 = self.sage_conv5(H_k, edgelist_t, ew_t[4])
     agg_feats6 = self.sage_conv6(H_k, edgelist_t, ew_t[5])
-    if self.d_spec:
-      agg_feats_concat = torch.cat((H_k, agg_feats1, agg_feats2, agg_feats3,
-                      agg_feats4, agg_feats5, agg_feats6,
-                      spectral_density_projected), dim=1)
-    else:
-      agg_feats_concat = torch.cat((H_k, agg_feats1, agg_feats2, agg_feats3,
-                      agg_feats4, agg_feats5, agg_feats6), dim=1)
+    
+    agg_feats_concat = torch.cat((H_k, agg_feats1, agg_feats2, agg_feats3,
+                    agg_feats4, agg_feats5, agg_feats6), dim=1)
+    self.dropout(agg_feats_concat)
+
     agg_feats_projected = self.sage_combine_projection(agg_feats_concat)
     agg_feats_projected = self.relu(agg_feats_projected)
     agg_feats_projected = self.dropout(agg_feats_projected)
@@ -561,6 +567,8 @@ class DspGNN(nn.Module):
     H_t, (hn, cn) = self.lstm(H_K_stack) # [N, K, d] for batch_first = True
     H_t = hn[-1] # last step only
     H_t = self.relu(H_t)
+    if self.norma:
+      H_t = F.normalize(H_t, p=2, dim=1)
     return H_t
 
   def forward(self, H_K_prev, edgelists, spec_attr_prev):
@@ -568,28 +576,10 @@ class DspGNN(nn.Module):
     H_t = self._step(H_K_prev, edgelists, spec_attr_prev)
     return torch.unsqueeze(H_t, 0) # [N,d] -> [1,N,d]
 
+
+
+
 """## [ Mods ] Commun Modules"""
-
-class MLP_Regressor(nn.Module):
-  """2-layers Regression with GeLU"""
-  def __init__(self, hidden_dims, output_dims, expansion_factor=0.5, dropout=0.5):
-    super(MLP_Regressor, self).__init__()
-    self.dh = hidden_dims
-    self.do = output_dims
-    self.expansion_factor = expansion_factor
-    self.dropout = dropout
-    self.lin0 = nn.Linear(hidden_dims, int(expansion_factor * hidden_dims))
-    self.lin1 = nn.Linear(int(expansion_factor * hidden_dims), output_dims)
-    # self.reset_parameters()
-
-  def forward(self, x, ts):
-    x = self.lin0(x)
-    x = F.gelu(x)
-    x = F.dropout(x, p=self.dropout, training=self.training)
-    x = self.lin1(x)
-    x = F.dropout(x, p=self.dropout, training=self.training)
-    return x
-
 
 class Linear_Regressor(nn.Module):
   def __init__(self, hidden_dims, output_dims):
@@ -606,9 +596,6 @@ class Linear_Regressor(nn.Module):
       nn.init.xavier_uniform_(param)
 
   def forward(self, x, ts):
-    # if self.eval:
-    #   return self.relu(torch.matmul(x, self.weight_M))
-    # else:
     return torch.matmul(x, self.weight_M)
 
 class LinkPredictor(nn.Module):
@@ -642,6 +629,9 @@ class LinkPredictor(nn.Module):
       )
     return loss
 
+
+
+
 """## [ Funcs ] Snapshot-level Inference"""
 
 def snapshot_link_pred(H_t, real_edges_t, negative_edges_t, e_pred, verbose=False):
@@ -665,6 +655,9 @@ def snapshot_reg_process(H_t, current_df, args, mode='edge'):
   true_attrs = current_df['attr'].values.reshape(-1, 1)
   true_attrs = torch.tensor(true_attrs).float()
   return H_inputs, true_attrs
+
+
+
 
 """## [ Funcs ] Metrics Calcul"""
 
@@ -754,6 +747,8 @@ def evaluation(start_ts, end_ts, H_K_prev, links_df, nodes_attr, edgelists,
 def customize_score_func(rmse, f1, args):
   return rmse
 
+
+
 """# Main Func"""
 
 def data_processing_pipeline(args, egc_df=None, skip_ns=False):
@@ -761,14 +756,15 @@ def data_processing_pipeline(args, egc_df=None, skip_ns=False):
   Processing
   """
   set_seed(args.seed)
-  # if args.data[:2] == "bc":
-  #   rawdata = data_bc_readcsv_norm(args.data_path, time_win_aggr=args.T)
-  # if args.data == "mls":
-  #   rawdata = data_bc_readcsv_norm(args.data_path, time_win_aggr=args.T, skip_header=True)
-  # nodes_df, links_df, nodes_attr = data_bc_prepare_dataframes(rawdata, args.vreg_gen_subsample_mask, args.vreg_degree_norm)
-  if args.data[:3] == "egc":
-    nodes_df, links_df, nodes_attr = data_egc_dt_prepare_dataframes(egc_df, args.vreg_gen_subsample_mask, args.vreg_degree_norm)
-
+  if args.data[:2] == "bc":
+    rawdata = data_bc_readcsv_norm(args.data_path, time_win_aggr=args.T)
+  elif args.data in ["mls"]:
+    rawdata = data_bc_readcsv_norm(args.data_path, time_win_aggr=args.T, skip_header=True)
+  elif args.data in ["uci"]:
+    rawdata = data_bc_readcsv_norm(args.data_path, time_win_aggr=args.T, norm_func='log10-min-max', skip_header=True)
+  elif args.data[:3] == "egc":
+    nodes_df, links_df = data_egc_dt_prepare_dataframes(egc_df, args.vreg_gen_subsample_mask, args.vreg_degree_norm)
+  nodes_attr = None
   ## Extracting Edgelist per snapshot
   nodes, times, edgelists, edgelists_attr = load_temporalgraphs(nodes_df, links_df)
   args.N = len(nodes)
@@ -778,6 +774,8 @@ def data_processing_pipeline(args, egc_df=None, skip_ns=False):
   negative_edgelists, nodelists = negative_edge_sampling(edgelists, idx_end_train=args.idx_end_train, times=times, tot_nodes=args.N,
                   train_neg_sample_coef=args.train_neg_sample_coef, seed=args.seed)
   return args, nodes_df, links_df, nodes_attr, nodes, times, edgelists, edgelists_attr, negative_edgelists, nodelists
+
+
 
 
 def train_test_pipeline(args, nodes_df, links_df, nodes_attr, nodes, times, edgelists, edgelists_attr, negative_edgelists, nodelists):
@@ -799,32 +797,20 @@ def train_test_pipeline(args, nodes_df, links_df, nodes_attr, nodes, times, edge
   else:
     additional_attr = None
 
-  if args.model == "CoEvoSAGELSTM":
-    if args.convmod == "GAT": ## GAT
-      enc = CoEvoSAGELSTM(N=args.N, d_h=args.d_h,
-            K=args.K, num_sample_neighbors=args.num_sample_neighbors,
-            convmod="GAT")
-    else: ## GraphSAGE
-      enc = CoEvoSAGELSTM(N=args.N, d_h=args.d_h,
-            K=args.K, num_sample_neighbors=args.num_sample_neighbors)
-  elif args.model == "CoEvoSage":
-    enc = CoEvoSAGE(N=args.N, hid_emb_dim=args.d_h,
-          K=args.K, num_sample_neighbors=args.num_sample_neighbors)
-  elif args.model == "DspGNN":
+
+  if args.motif == "DspGNN":
     enc = DspGNN(args, ablation_test_spectral_sup=args.ablation_test_spectral_sup)
-  elif args.model == "EvolveGCN":
-    enc = EvolveGCN(args.N, args.d_h, args.K)
+  elif args.motif == "CoEvoSage":
+    enc = CoEvoSAGE(N=args.N, hid_emb_dim=args.d_h, K=args.K, num_sample_neighbors=args.num_sample_neighbors)
+  elif args.motif == "EvolveGCN":
+    enc = TgtEvolveGCNH(N=args.N, d_h=args.d_h)
+  elif args.motif == "GCLSTM":
+    enc = TgtGCLstm(N=args.N, d_h=args.d_h, nb_spectral_supports=args.nb_spectral_supports)
 
 
-  if args.regressor == "1L":
-    Regressor = Linear_Regressor
-  elif args.regressor == "2L":
-    Regressor = MLP_Regressor
-
+  Regressor = Linear_Regressor
   if args.task == "ereg":
     reg = Regressor(hidden_dims=2*args.d_h, output_dims=args.reg_e_targets)
-  elif args.task == "vreg":
-    reg = Regressor(hidden_dims=args.d_h, output_dims=args.reg_v_targets)
 
   eclf = LinkPredictor()  # Non-parametric model
   models = [enc, reg, eclf]
@@ -905,7 +891,6 @@ def train_test_pipeline(args, nodes_df, links_df, nodes_attr, nodes, times, edge
     for param in params:
       param.requires_grad = False
 
-    # set_seed(args.seed)
     val_accs, val_aucs, val_f1s, val_maes, val_rmses, H_K_prev = evaluation(
       args.idx_end_train, args.idx_end_valid, H_K_prev, links_df, nodes_attr, edgelists, negative_edgelists, enc, reg, eclf, args,
       additional_attr)
@@ -937,14 +922,11 @@ def train_test_pipeline(args, nodes_df, links_df, nodes_attr, nodes, times, edge
       print("VALID Epoch-level-RMSE: ", val_rmses, "\nVALID Epoch-level-F1  : ", val_f1s)
       print("TEST  Epoch-level-RMSE: ", tst_rmses, "\nTEST  Epoch-level-F1  : ", tst_f1s)
 
-    # print(H_t)
-
     ''' Check valid if is best epoch'''
     new_val_rmse = np.mean(val_rmses)
     new_val_f1 = np.mean(val_f1s)
     new_syn_score = customize_score_func(new_val_rmse, new_val_f1, args)
     if new_syn_score <= best_syn_score and new_train_loss <= best_train_loss:
-    # if new_val_rmse <= best_val_rmse and new_train_loss <= best_train_loss and new_val_f1 >= best_val_f1:
       print("!!!!!!!! best epo !!!!!!!!")
       bests = [ep, np.mean(tst_maes), np.mean(tst_rmses), np.mean(tst_accs), np.mean(tst_f1s), np.mean(tst_aucs)]
       best_val_f1 = new_val_f1
@@ -1014,6 +996,14 @@ def dataset_selection(args):
     args.t_test = 18
     args.reg_e_targets = 1
 
+  elif args.data == "uci":
+    args.data_path = "data/uci/uci.csv"
+    args.T = 88
+    args.t_train = 62
+    args.t_valid = 9
+    args.t_test = 17
+    args.reg_e_targets = 1
+
   args.idx_start_train = 1 + args.t_0
   args.idx_end_train = args.idx_start_train + args.t_train
   args.idx_end_valid = args.idx_end_train + args.t_valid
@@ -1055,15 +1045,13 @@ def commum_args_CoEvoSage(args, runs, log_type, wblog, e_param):
   '''logging_sys'''
   args.wblog = wblog
   args.wblog_type = log_type
-  args.wblog_project = "EGC-dt"
+  args.wblog_project = "..."
   if log_type == "debug":
     args.epochs = 5
-
-  '''Execution'''
-  ## logging
   if args.wblog:
     wandb.login()
   return args
+
 
 def args_baseline_bc_coevosage(data="bca", task="ereg" ,runs=2, log_type='debug', wblog=True, e_param=False):
   '''Args'''
@@ -1155,58 +1143,64 @@ def commum_args_DspGNN(args, runs, log_type, wblog, e_param):
     wandb.login()
   return args
 
+
 def runmain(args):
-  bests_l = []
   args = dataset_selection(args)
 
-  if args.model == "DspGNN":
-    load_edge_weights = torch.load('spec/%s_edge_spec_weights.pt'%args.data)
-    load_snapshot_eig = torch.load('spec/%s_snapshot_eigenval.pt'%args.data)
-    if args.HH:
-      load_edge_weights = torch.load('spec/HH/%s_edge_spec_weights.pt'%args.data)
+  if args.model[:6] == "DspGNN":
+    load_edge_weights = torch.load('spec/%s/%s_edge_spec_weights.pt'%(args.filter_type,args.data))
+    load_snapshot_eig = torch.load('spec/%s/%s_snapshot_eigenval.pt'%(args.filter_type,args.data))
+  set_seed(args.seed)
+  args, nodes_df, links_df, nodes_attr, nodes, times, edgelists, edgelists_attr, negative_edgelists, nodelists = data_processing_pipeline(args)
+  edgelists = torch.load('spec/%s/%s_edge_hh.pt'%(args.filter_type,args.data))
 
-  for seed in range(args.exps):
-    args.seed = seed
-    set_seed(args.seed)
-    args, nodes_df, links_df, nodes_attr, nodes, times, edgelists, edgelists_attr, negative_edgelists, nodelists = data_processing_pipeline(args)
-    if args.HH:
-      edgelists = torch.load('spec/HH/%s_edge_hh.pt'%args.data)
-    ## DspGNN Spectral supported edge weight
-    if args.model == "DspGNN":
-      if args.spec_support:
-        edgelists_attr = (edgelists_attr, load_edge_weights, load_snapshot_eig)
-    bests, trained_models = train_test_pipeline(args, nodes_df, links_df, nodes_attr, nodes, times, edgelists, edgelists_attr, negative_edgelists, nodelists)
-    bests_l.append(bests)
+  ## DspGNN Spectral supported edge weight
+  if args.model[:6] == "DspGNN":
+    if args.spec_support:
+      edgelists_attr = (edgelists_attr, load_edge_weights, load_snapshot_eig)
+
+  bests, trained_models = train_test_pipeline(args, nodes_df, links_df, nodes_attr, nodes, times, edgelists, edgelists_attr, negative_edgelists, nodelists)
   return bests, trained_models
 
+
+
+
+
+
 """# .< Start Testing >."""
+task="ereg"
+wblog=True # @param {type:'boolean'}
+debug=False # @param {type:'boolean'}
+log_type="..."
+dhs = [8,16,32,64]
+Ks = [1,3,6,12]
 
-wandb.login(key = "...")
+for seed in [0,1,2,3,4]:
+  for data in ['bca', 'bco', 'uci', 'mls']:
+    for K in Ks:
+      for dh in dhs:
+        args = args_data(data=data, task=task)
+        args.seed = seed
+        args.debug = debug
+        args = args_params(args, d_h=dh, wblog=wblog, log_type=log_type, K=K)
 
-"""# Final Test Runned"""
+        for model in ['DspGNN', 'CoEvoSage', 'EvolveGCN', 'GCLSTM']:
+          args.spec_support = False
+          args.sp_pente = 0
+          args.nb_spectral_supports = 6
 
-debuging = False
+          args.motif = model
 
-logtype = '''...'''
-for d in ["bca"]: # "bco" #, "mls"
-  runs = 5
-  wblog = True
-  args = args_baseline_bc_dspgnn(data=d, task="ereg",
-                  runs=runs, log_type=logtype, wblog=wblog)
-  args.K, args.lr = [6, 0.003]
-  args.spec_support = True
-  args.loss_accum = False
-  args.ablation_test_spectral_sup = False
-  args.snapshot_level_verbose = False
+          if model == 'DspGNN':
+            args.model = 'DspGNN'
+            args.spec_support = True
+            args.filter_type = "HH_3_1"
+            args.sp_pente = 1
+          else:
+            args.filter_type = "NoFilter"
+            args.model = model
 
-  print("Debugging ?", debuging)
-  if debuging:
-    args.epochs = 10 #20
-    args.debug = True
-    args.seed = 42
+          runmain(args)
 
-  args.HH = True
-
-  runmain(args)
-
-wandb.finish()
+          args = dataset_selection(args)
+          args, nodes_df, links_df, nodes_attr, nodes, times, edgelists, edgelists_attr, negative_edgelists, nodelists = data_processing_pipeline(args)
